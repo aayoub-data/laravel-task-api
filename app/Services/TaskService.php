@@ -3,13 +3,10 @@
 namespace App\Services;
 
 use App\Models\Task;
-use App\Models\User;
 use App\Repositories\TaskRepository;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Collection;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
-use InvalidArgumentException;
+use Illuminate\Validation\ValidationException;
 
 class TaskService
 {
@@ -18,167 +15,69 @@ class TaskService
     ) {}
 
     /**
-     * List tasks with filters and pagination.
+     * List tasks for the authenticated user.
      */
-    public function listTasks(
-        array $filters = [],
-        int $perPage = 15,
-        string $sortBy = 'created_at',
-        string $sortDirection = 'desc'
-    ): LengthAwarePaginator {
-        return $this->taskRepository->getPaginated($filters, $perPage, $sortBy, $sortDirection);
+    public function listTasks(int $userId, ?string $status = null, int $perPage = 15): LengthAwarePaginator
+    {
+        return $this->taskRepository->getAllForUser($userId, $status, $perPage);
     }
 
     /**
-     * Get a single task by ID.
+     * Create a new task for a user.
      */
-    public function getTask(int $id): Task
+    public function createTask(int $userId, array $data): Task
     {
-        return $this->taskRepository->findOrFail($id);
+        $data['user_id'] = $userId;
+        $data['status'] = $data['status'] ?? Task::STATUS_PENDING;
+
+        return $this->taskRepository->create($data);
     }
 
     /**
-     * Create a new task.
+     * Get a specific task, ensuring it belongs to the user.
+     *
+     * @throws ValidationException
      */
-    public function createTask(array $data, User $owner): Task
+    public function getTask(int $taskId, int $userId): Task
     {
-        return DB::transaction(function () use ($data, $owner) {
-            $taskData = array_merge($data, [
-                'owner_id' => $owner->id,
-                'status' => Task::STATUS_PENDING,
+        $task = $this->taskRepository->findByIdForUser($taskId, $userId);
+
+        if (!$task) {
+            throw ValidationException::withMessages([
+                'task' => ['Task not found or access denied.'],
             ]);
+        }
 
-            $task = $this->taskRepository->create($taskData);
-
-            Log::info('Task created', [
-                'task_id' => $task->id,
-                'owner_id' => $owner->id,
-                'title' => $task->title,
-            ]);
-
-            return $task;
-        });
+        return $task;
     }
 
     /**
      * Update an existing task.
+     *
+     * @throws ValidationException
      */
-    public function updateTask(int $taskId, array $data, User $user): Task
+    public function updateTask(int $taskId, int $userId, array $data): Task
     {
-        $task = $this->taskRepository->findOrFail($taskId);
-
-        $this->authorizeTaskAccess($task, $user);
-
-        return DB::transaction(function () use ($task, $data) {
-            $updatedTask = $this->taskRepository->update($task, $data);
-
-            Log::info('Task updated', [
-                'task_id' => $task->id,
-                'changes' => array_keys($data),
-            ]);
-
-            return $updatedTask;
-        });
-    }
-
-    /**
-     * Mark a task as completed.
-     */
-    public function completeTask(int $taskId, User $user): Task
-    {
-        $task = $this->taskRepository->findOrFail($taskId);
-
-        $this->authorizeTaskAccess($task, $user);
-
-        if ($task->status === Task::STATUS_COMPLETED) {
-            throw new InvalidArgumentException('Task is already completed.');
-        }
-
-        if ($task->status === Task::STATUS_CANCELLED) {
-            throw new InvalidArgumentException('Cannot complete a cancelled task.');
-        }
-
-        $task->markCompleted();
-
-        Log::info('Task completed', [
-            'task_id' => $task->id,
-            'completed_by' => $user->id,
-        ]);
-
-        return $task->fresh(['owner', 'assignee']);
-    }
-
-    /**
-     * Assign a task to a user.
-     */
-    public function assignTask(int $taskId, int $assigneeId, User $currentUser): Task
-    {
-        $task = $this->taskRepository->findOrFail($taskId);
-
-        $this->authorizeTaskAccess($task, $currentUser);
-
-        $assignee = User::findOrFail($assigneeId);
-
-        if (!$assignee->is_active) {
-            throw new InvalidArgumentException('Cannot assign task to an inactive user.');
-        }
-
-        $updatedTask = $this->taskRepository->update($task, [
-            'assignee_id' => $assignee->id,
-            'status' => Task::STATUS_IN_PROGRESS,
-        ]);
-
-        Log::info('Task assigned', [
-            'task_id' => $task->id,
-            'assignee_id' => $assignee->id,
-            'assigned_by' => $currentUser->id,
-        ]);
-
-        return $updatedTask;
+        $task = $this->getTask($taskId, $userId);
+        return $this->taskRepository->update($task, $data);
     }
 
     /**
      * Delete a task.
+     *
+     * @throws ValidationException
      */
-    public function deleteTask(int $taskId, User $user): void
+    public function deleteTask(int $taskId, int $userId): bool
     {
-        $task = $this->taskRepository->findOrFail($taskId);
-
-        $this->authorizeTaskAccess($task, $user);
-
-        $this->taskRepository->delete($task);
-
-        Log::info('Task deleted', [
-            'task_id' => $taskId,
-            'deleted_by' => $user->id,
-        ]);
+        $task = $this->getTask($taskId, $userId);
+        return $this->taskRepository->delete($task);
     }
 
     /**
-     * Get task statistics for the current user.
+     * Get overdue tasks for a user.
      */
-    public function getUserStats(User $user): array
+    public function getOverdueTasks(int $userId): Collection
     {
-        return $this->taskRepository->getStatsForUser($user->id);
-    }
-
-    /**
-     * Get overdue tasks.
-     */
-    public function getOverdueTasks(): Collection
-    {
-        return $this->taskRepository->getOverdue();
-    }
-
-    /**
-     * Verify user has access to modify the task.
-     */
-    protected function authorizeTaskAccess(Task $task, User $user): void
-    {
-        if ($task->owner_id !== $user->id && $task->assignee_id !== $user->id) {
-            throw new InvalidArgumentException(
-                'You do not have permission to modify this task.'
-            );
-        }
+        return $this->taskRepository->getOverdueForUser($userId);
     }
 }
